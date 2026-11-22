@@ -213,8 +213,10 @@ class Selector:
 
         if same_code(path, old_text, new_text):
             return set()
+        from verify import ccompile
+
         try:
-            compile(new_text, path, "exec", dont_inherit=True)
+            ccompile(new_text, path)
         except SyntaxError:
             # file cannot be imported any more: every test that imports it fails
             self.notes.append(("syntax", path))
@@ -515,8 +517,14 @@ HEAVY_MS = 1000  # tests slower than this are never run here, only listed
 LIGHT_LIMIT_MS = int(os.environ.get("BR_LIGHT_LIMIT", "4000"))  # verify only if light candidates run this fast
 DROP_HEAVY = os.environ.get("BR_DROP_HEAVY", "1") == "1"
 MIN_LIGHT_FOR_DROP = int(os.environ.get("BR_MIN_LIGHT", "3"))
+NEVER_DROP = {
+    "tests/test_parser.py::TestParser::test_max_nodes",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+}
 PARALLEL = 2
 IMPORT_LINES = {}
+SELECTOR = None
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "2.0"))
 SETUP_COST_MS = {"tests/test_executor.py": 1400, "tests/test_optimizer.py": 150}
 
@@ -528,6 +536,8 @@ def main():
     with open(MAP, "rb") as fh:
         data = pickle.load(fh)
     s = Selector(data, tests)
+    global SELECTOR
+    SELECTOR = s
     IMPORT_LINES.update(s.import_lines)
     results = {}
     plans = []
@@ -587,7 +597,7 @@ def verifiable_changes(text):
         src = SRC / path
         if not src.exists():
             return None
-        old_text = src.read_text()
+        old_text = SELECTOR.read_src(path)
         new_text, changed_lines = apply_and_changes(old_text, f["hunks"])
         from verify import same_code
 
@@ -650,6 +660,10 @@ def run_plans(plans, tests, dur, results):
                     # something broke (or too little evidence): keep the slow tests, and with
                     # fail-fast the remaining fast ones are unverified, so keep them all
                     bad = sel | heavy if bad else heavy
+                elif heavy:
+                    # fast tests on the same code all pass: drop slow behaviour tests, but keep
+                    # the resource-limit tests (memory, node limits) that fast tests cannot stand in for
+                    bad = {h for h in heavy if tests[h]["id"] in NEVER_DROP}
                 results[cid] = bad
                 log(cid, "verified", len(sel), "+", len(heavy), "->", len(results[cid]))
             else:

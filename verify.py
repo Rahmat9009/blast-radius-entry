@@ -47,11 +47,29 @@ def _norm_sig(co):
             co.co_flags, co.co_argcount, co.co_kwonlyargcount, tuple(consts))
 
 
+_CC = {}
+
+
+def ccompile(text, path):
+    """compile() with a cache; raises SyntaxError like compile()."""
+    key = (path, hash(text), len(text))
+    got = _CC.get(key)
+    if got is None:
+        try:
+            got = compile(text, path, "exec", dont_inherit=True)
+        except SyntaxError as e:
+            got = e
+        _CC[key] = got
+    if isinstance(got, SyntaxError):
+        raise got
+    return got
+
+
 def same_code(path, old_text, new_text):
     """True if both sources compile to the same code apart from line numbers."""
     try:
-        a = compile(old_text, path, "exec", dont_inherit=True)
-        b = compile(new_text, path, "exec", dont_inherit=True)
+        a = ccompile(old_text, path)
+        b = ccompile(new_text, path)
     except SyntaxError:
         return False
     return _norm_sig(a) == _norm_sig(b)
@@ -69,8 +87,8 @@ def code_changes(path, old_text, new_text):
     """Return {(qualname, firstlineno): new_code} for changed function bodies, or None if a
     module/class body changed or the shapes do not line up."""
     try:
-        old_co = compile(old_text, path, "exec", dont_inherit=True)
-        new_co = compile(new_text, path, "exec", dont_inherit=True)
+        old_co = ccompile(old_text, path)
+        new_co = ccompile(new_text, path)
     except SyntaxError:
         return None
     olds = walk_codes(old_co, [])
@@ -247,8 +265,18 @@ class Runner:
         # fine: their parent code was swapped and creates them from the new consts.
         # Anything not found is reported so the caller can decide.
         missing = [list(k[1:]) for k in wanted if k not in found and not _nested_ok(k, wanted)]
+        stems = {os.path.basename(p)[:-3] for p in changes}
+        setup_heavy = {"tests/test_executor.py"}
+
+        def order(n):
+            t = self.tests[n]
+            meth = t["id"].rsplit("::", 1)[-1]
+            hit = any(st and st in meth for st in stems)
+            # likely failures first (fail-fast), expensive class setups last; keep classes together
+            return (not hit, t["file"] in setup_heavy, t["file"], t["id"])
+
         suite = unittest.TestSuite()
-        for n in sorted(nums, key=lambda n: self.tests[n]["id"]):
+        for n in sorted(nums, key=order if fail_fast else (lambda n: self.tests[n]["id"])):
             t = self.tests[n]
             mod = self.mods[t["file"]]
             _, cls, meth = t["id"].split("::")
