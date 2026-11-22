@@ -8,11 +8,30 @@ num = [by.get(n) for n in idx["node_ids"]]
 sets = [tuple(s) for s in d["sets"]]
 ids = {s: i for i, s in enumerate(sets)}
 lm = d["line_map"]
+import ast, os
+SRC = os.environ.get("SRC", "/home/claude/br/sqlglot")
+
+
+def def_body_lines(f):
+    try:
+        tree = ast.parse(open(os.path.join(SRC, f)).read())
+    except Exception:
+        return set()
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.update(range(n.body[0].lineno, n.end_lineno + 1))
+    return out
+
+
 added = 0
 for f, lines in idx["lines"].items():
     fl = lm.setdefault(f, {})
+    body = def_body_lines(f)
     for l, tids in lines.items():
         l = int(l)
+        if l not in body:
+            continue  # module/class level and lambda lines: their attribution is import-time noise
         theirs = {num[i] for i in tids if num[i] is not None}
         cur = set(sets[fl[l]]) if l in fl else set()
         if theirs - cur:
