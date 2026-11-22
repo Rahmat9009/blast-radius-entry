@@ -16,6 +16,7 @@ num = {t["id"]: t["number"] for t in tests}
 
 merged = {}
 import_lines = {}
+scopes = []
 for p in glob.glob(os.path.join(trace_dir, "trace-*.json")):
     d = json.load(open(p))
     for k, v in d.items():
@@ -23,10 +24,30 @@ for p in glob.glob(os.path.join(trace_dir, "trace-*.json")):
             for f, ls in v["lines"].items():
                 import_lines.setdefault(f, set()).update(ls)
             continue
+        if k.startswith("__scope__::"):
+            scopes.append((k, v))
+            continue
         n = num.get(k)
         if n is None:
             # parametrised ids may differ; try prefix match later
             continue
+        m = merged.setdefault(n, {"lines": {}, "files": set(), "dialects": set()})
+        for f, ls in v["lines"].items():
+            m["lines"].setdefault(f, set()).update(ls)
+        m["files"].update(v["files"])
+        m["dialects"].update(v["dialects"])
+
+# give every test the lines/files of the class/module/session fixtures it depends on
+for k, v in scopes:
+    _, scope, sid = k.split("::", 2)
+    if scope == "session" or not sid:
+        members = [t["number"] for t in tests]
+    elif scope == "module" or sid.count("::") == 0:
+        members = [t["number"] for t in tests if t["file"] == sid.split("::")[0]]
+    else:
+        members = [t["number"] for t in tests if t["id"].startswith(sid + "::")]
+    print("scope", scope, sid, len(members), len(v["lines"]), len(v["files"]), file=sys.stderr)
+    for n in members:
         m = merged.setdefault(n, {"lines": {}, "files": set(), "dialects": set()})
         for f, ls in v["lines"].items():
             m["lines"].setdefault(f, set()).update(ls)

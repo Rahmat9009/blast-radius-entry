@@ -110,6 +110,35 @@ def _hook_dialect():
 
 
 @pytest.hookimpl(hookwrapper=True)
+def pytest_fixture_setup(fixturedef, request):
+    """Class/module/session fixtures (setUpClass, setUpModule) run once but every test in
+    their scope depends on them: record what they touch under the scope's key."""
+    if fixturedef.scope == "function":
+        yield
+        return
+    saved = (_cur["lines"], _cur["files"], _cur["dialects"], set(_cur_types))
+    _cur["lines"], _cur["files"], _cur["dialects"] = set(), set(), set()
+    _cur_types.clear()
+    M.restart_events()
+    try:
+        yield
+    finally:
+        node = request.node
+        scope_id = getattr(node, "nodeid", "") if fixturedef.scope != "session" else ""
+        key = "__scope__::" + fixturedef.scope + "::" + scope_id
+        d = _data.setdefault(key, {"lines": set(), "files": set(), "dialects": set()})
+        d["lines"] |= _cur["lines"]
+        d["files"] |= _cur["files"]
+        d["dialects"] |= _cur["dialects"]
+        d["dialects"] |= {"E:" + t.__module__ + "." + t.__qualname__ for t in _cur_types}
+        lines, files, dialects, types = saved
+        _cur["lines"] = lines | _cur["lines"]
+        _cur["files"] = files | _cur["files"]
+        _cur["dialects"] = dialects | _cur["dialects"]
+        _cur_types.update(types)
+
+
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     _flush("__collect__")
     _hook_dialect()
@@ -178,6 +207,8 @@ def pytest_collection_finish(session):
     try:
         import sqlglot
 
+        if os.environ.get("BRTRACE_NOPRE") == "1":
+            raise ImportError
         for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
             if info.name == "sqlglot.__main__":
                 continue

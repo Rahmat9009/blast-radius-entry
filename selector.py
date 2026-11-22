@@ -197,28 +197,32 @@ class Selector:
             return set()
         if not path.endswith(".py"):
             return set(self.file_tests.get(path, ())) | self.dir_readers(path)
+        readers = set(self.file_tests.get(path, ())) | set(self.file_tests.get(f["new"] or "", ()))
+        r = self._select_py(f, path)
+        return r | readers
+
+    def _select_py(self, f, path):
         src = SRC / path
         if f["old"] is None or not src.exists():
             # new python file: tests importing it would be listed by module; be broad
             self.notes.append(("newfile", path))
             return set()
-        old_text = src.read_text()
+        old_text = self.read_src(path)
         new_text, changed = apply_and_changes(old_text, f["hunks"])
-        try:
-            old_tree = ast.parse(old_text)
-        except SyntaxError:
+        from verify import same_code
+
+        if same_code(path, old_text, new_text):
             return set()
         try:
-            new_tree = ast.parse(new_text)
+            compile(new_text, path, "exec", dont_inherit=True)
         except SyntaxError:
             # file cannot be imported any more: every test that imports it fails
             self.notes.append(("syntax", path))
             return self.importers(path)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        try:
+            info = self.file_info(path)
+        except SyntaxError:
             return set()
-        info = self.info_cache.get(path)
-        if info is None:
-            info = self.info_cache[path] = Info(old_tree)
         res = set()
         nlines = old_text.count("\n") + 1
         for c in changed:
@@ -482,6 +486,11 @@ def assigned_names(node):
 # ---------------------------------------------------------------- packing
 
 
+def pack_cost(nums, dur):
+    ws = pack(nums, dur)
+    return (max(sum(dur[n] for n in w) for w in ws) + WORKER_COST * len(ws)) if ws else 0
+
+
 def pack(nums, dur):
     """Split tests over workers minimising max load + WORKER_COST per worker."""
     if not nums:
@@ -503,8 +512,13 @@ def pack(nums, dur):
 
 
 HEAVY_MS = 1000  # tests slower than this are never run here, only listed
-LIGHT_LIMIT_MS = 4000  # verify a commit only if its candidates run this fast
+LIGHT_LIMIT_MS = int(os.environ.get("BR_LIGHT_LIMIT", "4000"))  # verify only if light candidates run this fast
+DROP_HEAVY = os.environ.get("BR_DROP_HEAVY", "1") == "1"
+MIN_LIGHT_FOR_DROP = int(os.environ.get("BR_MIN_LIGHT", "3"))
 PARALLEL = 2
+IMPORT_LINES = {}
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "2.0"))
+SETUP_COST_MS = {"tests/test_executor.py": 1400, "tests/test_optimizer.py": 150}
 
 
 def main():
@@ -514,6 +528,7 @@ def main():
     with open(MAP, "rb") as fh:
         data = pickle.load(fh)
     s = Selector(data, tests)
+    IMPORT_LINES.update(s.import_lines)
     results = {}
     plans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
@@ -527,9 +542,19 @@ def main():
             results[cid] = set(dur)
             continue
         results[cid] = sel
-        if not sel or any(dur[n] > HEAVY_MS for n in sel):
+        if not sel:
             continue
-        if sum(dur[n] for n in sel) > LIGHT_LIMIT_MS:
+        light = {n for n in sel if dur[n] <= HEAVY_MS}
+        heavy = sel - light
+        if not light or sum(dur[n] for n in light) > LIGHT_LIMIT_MS:
+            continue
+        if heavy and not DROP_HEAVY:
+            continue
+        est_cpu = sum(dur[n] for n in light) + sum(
+            SETUP_COST_MS.get(f, 0) for f in {tests[n]["file"] for n in light}
+        ) + 100
+        gain = pack_cost(sel, dur)
+        if CPU_FACTOR * est_cpu > (0.6 * gain if heavy else gain):
             continue
         try:
             changes = verifiable_changes(text)
@@ -537,7 +562,7 @@ def main():
             log("verify-plan error", cid, repr(e))
             changes = None
         if changes:
-            plans.append((cid, changes, sel))
+            plans.append((cid, changes, light, heavy))
     if plans and os.environ.get("BR_VERIFY", "1") == "1":
         try:
             run_plans(plans, tests, dur, results)
@@ -563,12 +588,14 @@ def verifiable_changes(text):
         if not src.exists():
             return None
         old_text = src.read_text()
-        new_text, _ = apply_and_changes(old_text, f["hunks"])
-        try:
-            if ast.dump(ast.parse(old_text)) == ast.dump(ast.parse(new_text)):
-                continue
-        except SyntaxError:
-            return None
+        new_text, changed_lines = apply_and_changes(old_text, f["hunks"])
+        from verify import same_code
+
+        if same_code(path, old_text, new_text):
+            continue
+        il = IMPORT_LINES.get(path, ())
+        if il and any((c if c > 0 else -c) in il or (c <= 0 and -c + 1 in il) for c in changed_lines):
+            return None  # this code runs at import time; swapping it later proves nothing
         ch = code_changes(path, old_text, new_text)
         if ch is None:
             return None
@@ -583,43 +610,53 @@ def run_plans(plans, tests, dur, results):
 
     from verify import Runner
 
-    files = {tests[n]["file"] for _, _, sel in plans for n in sel}
+    files = {tests[n]["file"] for _, _, sel, _ in plans for n in sel}
     r = Runner(str(SRC), tests)
     t1 = time.time()
     r.prepare(files)
+    import resource
+    _ru = resource.getrusage(resource.RUSAGE_SELF)
+    log(f"parent cpu {_ru.ru_utime + _ru.ru_stime:.2f}s")
     log(f"prepared {len(r.mods)} test modules in {time.time() - t1:.2f}s")
     queue = [p for p in plans if r.can_run(p[2])]
+    queue.sort(key=lambda p: -sum(dur[n] for n in p[3]))
     running = {}
     while queue or running:
         while queue and len(running) < PARALLEL:
-            cid, changes, sel = queue.pop(0)
-            pid, fd = r.start(changes, sel)
-            limit = 3 + 3 * sum(dur[n] for n in sel) / 1000
-            running[fd] = (pid, cid, sel, time.time() + limit, [])
+            cid, changes, sel, heavy = queue.pop(0)
+            pid, fd = r.start(changes, sel, fail_fast=bool(heavy))
+            limit = 8 + 8 * sum(dur[n] for n in sel) / 1000
+            running[fd] = (pid, cid, sel, time.time() + limit, [], heavy)
         now = time.time()
         timeout = max(0.01, min(v[3] for v in running.values()) - now)
         ready, _, _ = select.select(list(running), [], [], timeout)
         for fd in ready:
-            pid, cid, sel, dl, buf = running[fd]
+            pid, cid, sel, dl, buf, heavy = running[fd]
             chunk = os.read(fd, 1 << 16)
             if chunk:
                 buf.append(chunk)
                 continue
             os.close(fd)
-            os.waitpid(pid, 0)
+            _, _, ru = os.wait4(pid, 0)
             del running[fd]
+            log(cid, f"child cpu {ru.ru_utime + ru.ru_stime:.2f}s")
             try:
                 res = json.loads(b"".join(buf) or b"{}")
             except ValueError:
                 res = {}
             if "bad" in res and not res.get("missing"):
-                results[cid] = set(res["bad"]) & sel
-                log(cid, "verified", len(sel), "->", len(results[cid]))
+                bad = set(res["bad"]) & sel
+                if heavy and (bad or len(sel) < MIN_LIGHT_FOR_DROP):
+                    # something broke (or too little evidence): keep the slow tests, and with
+                    # fail-fast the remaining fast ones are unverified, so keep them all
+                    bad = sel | heavy if bad else heavy
+                results[cid] = bad
+                log(cid, "verified", len(sel), "+", len(heavy), "->", len(results[cid]))
             else:
                 log(cid, "unverified", res.get("error"), res.get("missing"))
         now = time.time()
         for fd in list(running):
-            pid, cid, sel, dl, buf = running[fd]
+            pid, cid, sel, dl, buf, heavy = running[fd]
             if now > dl:
                 try:
                     os.kill(pid, signal.SIGKILL)

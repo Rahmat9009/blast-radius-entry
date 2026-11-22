@@ -31,6 +31,32 @@ def code_sig(co):
             co.co_flags, co.co_argcount, co.co_kwonlyargcount, tuple(consts))
 
 
+def _norm_sig(co):
+    """Signature without line numbers; a class body's __firstlineno__ const is normalised."""
+    consts = []
+    fl = co.co_firstlineno
+    is_func = bool(co.co_flags & CO_OPTIMIZED)
+    for c in co.co_consts:
+        if isinstance(c, types.CodeType):
+            consts.append(("<code>", c.co_qualname, _norm_sig(c)))
+        elif not is_func and type(c) is int and c == fl:
+            consts.append(("<firstlineno>",))
+        else:
+            consts.append((type(c).__name__, repr(c)))
+    return (co.co_code, co.co_names, co.co_varnames, co.co_freevars, co.co_cellvars,
+            co.co_flags, co.co_argcount, co.co_kwonlyargcount, tuple(consts))
+
+
+def same_code(path, old_text, new_text):
+    """True if both sources compile to the same code apart from line numbers."""
+    try:
+        a = compile(old_text, path, "exec", dont_inherit=True)
+        b = compile(new_text, path, "exec", dont_inherit=True)
+    except SyntaxError:
+        return False
+    return _norm_sig(a) == _norm_sig(b)
+
+
 def walk_codes(co, out):
     out.append(co)
     for c in co.co_consts:
@@ -111,18 +137,30 @@ class _Result(unittest.TestResult):
         super().__init__()
         self.bad = set()
 
-    def addError(self, test, err):
+    def _mark(self, test):
         self.bad.add(_tid(test))
+        if getattr(self, "failfast", False):
+            self.shouldStop = True
+
+    def addError(self, test, err):
+        self._mark(test)
 
     def addFailure(self, test, err):
-        self.bad.add(_tid(test))
+        self._mark(test)
 
     def addSubTest(self, test, subtest, err):
         if err is not None:
-            self.bad.add(_tid(test))
+            self._mark(test)
 
     def addUnexpectedSuccess(self, test):
         self.bad.add(_tid(test))
+
+    def addSkip(self, test, reason):
+        # a test that skips here may run (and fail) in the real environment
+        self._mark(test)
+
+    def addExpectedFailure(self, test, err):
+        pass
 
 
 def _tid(test):
@@ -160,7 +198,7 @@ class Runner:
     def can_run(self, nums):
         return all(self.tests[n]["file"] in self.mods for n in nums)
 
-    def start(self, changes, nums):
+    def start(self, changes, nums, fail_fast=False):
         """Fork a child. Returns (pid, read_fd)."""
         r, w = os.pipe()
         pid = os.fork()
@@ -168,7 +206,7 @@ class Runner:
             os.close(r)
             code = 1
             try:
-                out = self._child(changes, nums)
+                out = self._child(changes, nums, fail_fast)
                 os.write(w, json.dumps(out).encode())
                 code = 0
             except BaseException as e:  # noqa
@@ -181,7 +219,7 @@ class Runner:
         os.close(w)
         return pid, r
 
-    def _child(self, changes, nums):
+    def _child(self, changes, nums, fail_fast=False):
         sys.stdout = io.StringIO()  # never let a test print to our stdout
         import importlib
 
@@ -216,7 +254,10 @@ class Runner:
             _, cls, meth = t["id"].split("::")
             suite.addTest(getattr(mod, cls)(meth))
         res = _Result()
+        if fail_fast:
+            res.failfast = True
         suite.run(res)
+        ran = res.testsRun
         bad = []
         bad_classes = {d for d in res.bad if d[0] == "class"}
         idx = {}
