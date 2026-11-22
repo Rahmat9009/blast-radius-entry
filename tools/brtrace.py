@@ -171,6 +171,22 @@ class _SyncExecutor:
 
 
 def pytest_collection_finish(session):
+    # import every sqlglot module now, so import-time lines are attributed to collection
+    import importlib
+    import pkgutil
+
+    try:
+        import sqlglot
+
+        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+            if info.name == "sqlglot.__main__":
+                continue
+            try:
+                importlib.import_module(info.name)
+            except Exception:
+                pass
+    except Exception:
+        pass
     for name, mod in list(sys.modules.items()):
         if name.startswith("tests") and hasattr(mod, "ProcessPoolExecutor"):
             mod.ProcessPoolExecutor = _SyncExecutor

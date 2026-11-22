@@ -15,10 +15,13 @@ tests = json.load(open(tests_json))["tests"]
 num = {t["id"]: t["number"] for t in tests}
 
 merged = {}
+import_lines = {}
 for p in glob.glob(os.path.join(trace_dir, "trace-*.json")):
     d = json.load(open(p))
     for k, v in d.items():
         if k == "__collect__":
+            for f, ls in v["lines"].items():
+                import_lines.setdefault(f, set()).update(ls)
             continue
         n = num.get(k)
         if n is None:
@@ -142,3 +145,46 @@ with open(out, "wb") as fh:
     pickle.dump(data, fh, protocol=5)
 print("sets", len(sets), "files", len(line_map), "classes", len(cls_tests), file=sys.stderr)
 print("size", os.path.getsize(out), file=sys.stderr)
+
+# function spans for every python file: (start, end, import_time)
+import ast as _ast
+
+spans = {}
+for base in ("sqlglot", "tests"):
+    for dp, dn, fns in os.walk(os.path.join(src, base)):
+        if "__pycache__" in dp:
+            continue
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, src)
+            try:
+                tree = _ast.parse(open(full).read())
+            except SyntaxError:
+                continue
+            out_sp = []
+
+            def visit(node, meta=False, cls=None):
+                for ch in _ast.iter_child_nodes(node):
+                    if isinstance(ch, _ast.ClassDef):
+                        is_meta = any(isinstance(b, _ast.Name) and b.id == "type" for b in ch.bases)
+                        visit(ch, is_meta, ch)
+                    elif isinstance(ch, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        imp = ch.name == "__init_subclass__" or (meta and ch.name in ("__new__", "__init__"))
+                        out_sp.append((ch.body[0].lineno, ch.end_lineno, imp))
+                        visit(ch, False, None)
+                    elif isinstance(ch, _ast.Lambda):
+                        out_sp.append((ch.lineno, ch.end_lineno, False))
+                        visit(ch, False, None)
+                    else:
+                        visit(ch, meta, cls)
+
+            visit(tree)
+            spans[rel] = sorted(out_sp)
+
+data["spans"] = spans
+data["import_lines"] = {f: sorted(v) for f, v in import_lines.items()}
+with open(out, "wb") as fh:
+    pickle.dump(data, fh, protocol=5)
+print("spans files", len(spans), "size", os.path.getsize(out), file=sys.stderr)

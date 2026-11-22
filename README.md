@@ -35,7 +35,7 @@ dialects and expression classes used. `tools/buildmap.py` merges those traces in
 
 MIT
 
-## Coverage guard revision
+## Coverage guard (ChatGPT, not used by the Dockerfile right now)
 
 The guard combines the original selector with a separately collected baseline line and fixture index. The second index traces tests in actual worker processes and gives the selector another source of evidence for short-circuit expressions and class settings. The runtime emits the union of both candidate sets and schedules it using integer-millisecond test durations. It uses the Python standard library.
 

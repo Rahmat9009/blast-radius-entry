@@ -11,6 +11,7 @@ import os
 import pickle
 import re
 import sys
+import time
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -96,17 +97,21 @@ def apply_and_changes(old_text, hunks):
         start = h["old_start"] - 1 if h["old_len"] > 0 else h["old_start"]
         out.extend(old[pos:start])
         pos = start
+        removed_run = False
         for tag, text in h["lines"]:
             if tag == " ":
                 out.append(old[pos] if pos < len(old) else text)
                 pos += 1
+                removed_run = False
             elif tag == "-":
                 changed.add(pos + 1)
                 pos += 1
+                removed_run = True
             else:
                 out.append(text)
-                # insertion between old line pos and pos+1 (1-based)
-                changed.add(-(pos))  # marker: inserted after old line `pos`
+                if not removed_run:
+                    # pure insertion between old line pos and pos+1 (1-based)
+                    changed.add(-(pos))
     out.extend(old[pos:])
     return "\n".join(out), changed
 
@@ -159,7 +164,10 @@ class Selector:
         self.file_tests = data["file_tests"]
         self.cls_tests = data["cls_tests"]
         self.mod_tests = data["mod_tests"]
+        self.spans = data.get("spans", {})
+        self.import_lines = {f: set(v) for f, v in data.get("import_lines", {}).items()}
         self.tests = tests
+        self._mention_cache = {}
         self.info_cache = {}
         self.by_file = {}
         for t in tests:
@@ -251,7 +259,23 @@ class Selector:
                 break
         if func is not None:
             # runtime code inside a function body
-            return self.lines_tests(path, lo, hi)
+            r = self.lines_tests(path, lo, hi)
+            il = self.import_lines.get(path)
+            if il and any(l in il for l in range(lo, hi + 1)):
+                # this code also runs at import time (factories, metaclasses): anything built
+                # from it then is used by tests that never run this line themselves
+                outer_i = next(
+                    i for i, p in enumerate(chain)
+                    if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                )
+                outer = chain[outer_i]
+                cls_chain = [p for p in chain[:outer_i] if isinstance(p, ast.ClassDef)]
+                if cls_chain:
+                    r |= self.class_users(path, cls_chain)
+                elif isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    r |= self.names_users(path, [outer.name], [], (outer.lineno, outer.end_lineno))
+                self.notes.append(("importfunc", path, line))
+            return r
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # signature / decorator: tests that call the function
             fb = node.body[0].lineno
@@ -262,19 +286,130 @@ class Selector:
                 r |= self.name_users(path, node.name)
             return r
         # import-time statement at module or class level
+        lam = self.lambda_span(path, line)
+        if lam is not None:
+            return self.lines_tests(path, lam[0], lam[1])
         classes = [p for p in parents if isinstance(p, ast.ClassDef)]
         if isinstance(node, ast.ClassDef):
-            classes = classes + [node]
+            return self.class_users(path, classes + [node])
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            return self.attr_users(path, classes, node)
         if classes:
-            r = self.class_users(path, classes)
-            # lambdas or runtime code on these lines
-            r |= self.lines_tests(path, lo, hi)
-            return r
-        # module level
+            return self.class_users(path, classes)
+        # module level import or other statement
         r = set(self.mod_tests.get(path, ()))
         for name in assigned_names(node):
             r |= self.name_users(path, name)
         return r
+
+    def lambda_span(self, path, line):
+        best = None
+        for a, b, imp in self.spans.get(path, ()):
+            if a <= line <= b and not imp:
+                if best is None or b - a < best[1] - best[0]:
+                    best = (a, b)
+        return best
+
+    def span_kind(self, f, line):
+        best = None
+        for a, b, imp in self.spans.get(f, ()):
+            if a <= line <= b:
+                if best is None or b - a < best[1] - best[0]:
+                    best = (a, b, imp)
+        if best is None:
+            return "body"
+        return "importfunc" if best[2] else "runtime"
+
+    def mentions(self, name):
+        """(runtime_tests, test_file_tests, import_time_mentions) for an identifier."""
+        got = self._mention_cache.get(name)
+        if got is not None:
+            return got
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        rt = set()
+        rt_tests_dir = set()
+        imp = []
+        for f in self.spans:
+            try:
+                txt = self.read_src(f)
+            except OSError:
+                continue
+            if name not in txt:
+                continue
+            for m in pat.finditer(txt):
+                line = txt.count("\n", 0, m.start()) + 1
+                k = self.span_kind(f, line)
+                if k == "runtime":
+                    ts = self.lines_tests(f, line, line)
+                    rt |= ts
+                    if f.startswith("tests/"):
+                        rt_tests_dir |= ts
+                else:
+                    imp.append((f, line, k))
+        got = (rt, rt_tests_dir, imp)
+        self._mention_cache[name] = got
+        return got
+
+    def attr_users(self, path, classes, node):
+        return self.names_users(path, assigned_names(node), classes, (node.lineno, node.end_lineno))
+
+    def names_users(self, path, names, classes, own):
+        res = set()
+        for name in names:
+            rt, rt_tests, imp = self.mentions(name)
+            base = set(rt)
+            extra = set(rt_tests)
+            for f, line, kind in imp:
+                if f == path and own[0] <= line <= own[1]:
+                    continue
+                if kind == "importfunc":
+                    base |= set(self.mod_tests.get(f, ()))
+                    continue
+                try:
+                    finfo = self.file_info(f)
+                except Exception:
+                    extra |= set(self.mod_tests.get(f, ()))
+                    continue
+                hit = finfo.innermost(line)
+                if hit is None:
+                    continue
+                st, s0, e0, par = hit
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    extra |= self.lines_tests(f, st.body[0].lineno, st.end_lineno)
+                    continue
+                tnames = assigned_names(st)
+                value = getattr(st, "value", None)
+                mine = {c.name for c in classes}
+                reads = value is not None and any(
+                    (isinstance(n, ast.Name) and n.id == name)
+                    or (isinstance(n, ast.Attribute) and n.attr == name and _qual_ok(n.value, mine))
+                    for n in ast.walk(value)
+                )
+                if not reads:
+                    continue  # defines its own value, or reads an unrelated class's attribute
+                cls2 = [p for p in par if isinstance(p, ast.ClassDef)]
+                if isinstance(st, ast.ClassDef):
+                    extra |= self.class_users(f, cls2 + [st])
+                    continue
+                derived = set()
+                for m2 in tnames:
+                    if m2 != name:
+                        derived |= self.mentions(m2)[0]
+                if cls2:
+                    derived &= self.class_users(f, cls2)
+                extra |= derived
+            if classes:
+                res |= base & self.class_users(path, classes)
+            else:
+                res |= base
+            res |= extra
+        return res
+
+    def file_info(self, f):
+        info = self.info_cache.get(f)
+        if info is None:
+            info = self.info_cache[f] = Info(ast.parse(self.read_src(f)))
+        return info
 
     def class_users(self, path, classes):
         mod = path[:-3].replace("/", ".")
@@ -288,9 +423,11 @@ class Selector:
             if got:
                 res.update(got)
                 break
-        # tests that ran any code inside the outermost class
+        # tests that ran any runtime code (function bodies, lambdas) inside the outermost class
         outer = classes[0]
-        res |= self.lines_tests(path, outer.lineno, outer.end_lineno)
+        for a, b, imp in self.spans.get(path, ()):
+            if not imp and outer.lineno <= a and b <= outer.end_lineno:
+                res |= self.lines_tests(path, a, b)
         return res
 
     def name_users(self, path, name):
@@ -315,6 +452,15 @@ class Selector:
         if t is None:
             t = self._src_cache[f] = (SRC / f).read_text()
         return t
+
+
+def _qual_ok(q, mine):
+    """Could `q.NAME` read the attribute of one of our classes? `Other.NAME` with an
+    unrelated CamelCase class name cannot (unless inherited, which we accept)."""
+    last = q.attr if isinstance(q, ast.Attribute) else q.id if isinstance(q, ast.Name) else None
+    if last is None or not last[:1].isupper() or not mine:
+        return True
+    return last in mine
 
 
 def assigned_names(node):
@@ -356,22 +502,133 @@ def pack(nums, dur):
     return best[1]
 
 
+HEAVY_MS = 1000  # tests slower than this are never run here, only listed
+LIGHT_LIMIT_MS = 4000  # verify a commit only if its candidates run this fast
+PARALLEL = 2
+
+
 def main():
+    t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     dur = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     with open(MAP, "rb") as fh:
         data = pickle.load(fh)
     s = Selector(data, tests)
-    out = []
+    results = {}
+    plans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        cid = patch.stem
         try:
-            sel = s.select(patch.read_text())
+            text = patch.read_text()
+            sel = s.select(text)
+            sel = {n for n in sel if n in dur}
         except Exception as e:  # never crash: fall back to everything
-            log("error", patch.stem, repr(e))
-            sel = set(dur)
-        sel = {n for n in sel if n in dur}
-        out.append(json.dumps({"commit": patch.stem, "workers": pack(sel, dur)}))
+            log("error", cid, repr(e))
+            results[cid] = set(dur)
+            continue
+        results[cid] = sel
+        if not sel or any(dur[n] > HEAVY_MS for n in sel):
+            continue
+        if sum(dur[n] for n in sel) > LIGHT_LIMIT_MS:
+            continue
+        try:
+            changes = verifiable_changes(text)
+        except Exception as e:
+            log("verify-plan error", cid, repr(e))
+            changes = None
+        if changes:
+            plans.append((cid, changes, sel))
+    if plans and os.environ.get("BR_VERIFY", "1") == "1":
+        try:
+            run_plans(plans, tests, dur, results)
+        except Exception as e:
+            log("verify error", repr(e))
+    out = []
+    for cid in sorted(results):
+        out.append(json.dumps({"commit": cid, "workers": pack(results[cid], dur)}))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    sys.stdout.flush()
+    log(f"done in {time.time() - t0:.2f}s, verified {len(plans)}")
+
+
+def verifiable_changes(text):
+    from verify import code_changes
+
+    changes = {}
+    for f in parse_patch(text):
+        path = f["old"]
+        if path is None or f["new"] != path or not path.endswith(".py"):
+            return None
+        src = SRC / path
+        if not src.exists():
+            return None
+        old_text = src.read_text()
+        new_text, _ = apply_and_changes(old_text, f["hunks"])
+        try:
+            if ast.dump(ast.parse(old_text)) == ast.dump(ast.parse(new_text)):
+                continue
+        except SyntaxError:
+            return None
+        ch = code_changes(path, old_text, new_text)
+        if ch is None:
+            return None
+        if ch:
+            changes[path] = ch
+    return changes or None
+
+
+def run_plans(plans, tests, dur, results):
+    import select
+    import signal
+
+    from verify import Runner
+
+    files = {tests[n]["file"] for _, _, sel in plans for n in sel}
+    r = Runner(str(SRC), tests)
+    t1 = time.time()
+    r.prepare(files)
+    log(f"prepared {len(r.mods)} test modules in {time.time() - t1:.2f}s")
+    queue = [p for p in plans if r.can_run(p[2])]
+    running = {}
+    while queue or running:
+        while queue and len(running) < PARALLEL:
+            cid, changes, sel = queue.pop(0)
+            pid, fd = r.start(changes, sel)
+            limit = 3 + 3 * sum(dur[n] for n in sel) / 1000
+            running[fd] = (pid, cid, sel, time.time() + limit, [])
+        now = time.time()
+        timeout = max(0.01, min(v[3] for v in running.values()) - now)
+        ready, _, _ = select.select(list(running), [], [], timeout)
+        for fd in ready:
+            pid, cid, sel, dl, buf = running[fd]
+            chunk = os.read(fd, 1 << 16)
+            if chunk:
+                buf.append(chunk)
+                continue
+            os.close(fd)
+            os.waitpid(pid, 0)
+            del running[fd]
+            try:
+                res = json.loads(b"".join(buf) or b"{}")
+            except ValueError:
+                res = {}
+            if "bad" in res and not res.get("missing"):
+                results[cid] = set(res["bad"]) & sel
+                log(cid, "verified", len(sel), "->", len(results[cid]))
+            else:
+                log(cid, "unverified", res.get("error"), res.get("missing"))
+        now = time.time()
+        for fd in list(running):
+            pid, cid, sel, dl, buf = running[fd]
+            if now > dl:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                os.close(fd)
+                os.waitpid(pid, 0)
+                del running[fd]
+                log(cid, "timeout: keeping all", len(sel))
 
 
 if __name__ == "__main__":
