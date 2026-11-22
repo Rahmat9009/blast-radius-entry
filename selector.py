@@ -260,7 +260,15 @@ class Selector:
         except SyntaxError:
             # file cannot be imported any more: every test that imports it fails
             self.notes.append(("syntax", path))
+            if path.startswith("sqlglot/"):
+                return {t["number"] for t in self.tests}  # every importer breaks
             return self.importers(path)
+        if path.startswith("sqlglot/") and import_breaks(path, new_text):
+            # module or class code now raises at import time: every importer breaks
+            self.notes.append(("importerror", path))
+            log("import-time error after patch:", path)
+            self.partial_ok = False
+            return {t["number"] for t in self.tests}
         try:
             info = self.file_info(path)
         except SyntaxError:
@@ -818,6 +826,89 @@ def main():
 
 
 _BIGNUM = re.compile(r"(?<![\w.])\d{3,}")
+
+
+def import_breaks(path, new_text):
+    """Execute the patched module's top level in a forked child (fresh namespace seeded from
+    the real module) and report whether it raises. Only for changes outside function bodies."""
+    from verify import ccompile, code_changes
+
+    old_text = SELECTOR.read_src(path) if SELECTOR else (SRC / path).read_text()
+    try:
+        if code_changes(path, old_text, new_text) is not None:
+            return False  # only function bodies changed: nothing new runs at import
+    except Exception:
+        pass
+    if os.environ.get("BR_IMPORT_CHECK", "1") != "1":
+        return False
+    try:
+        code = ccompile(new_text, str(SRC / path))
+    except SyntaxError:
+        return True
+    # import the pristine module here once, so every forked check starts warm
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    os.environ.setdefault("SKIP_INTEGRATION", "0")
+    try:
+        import importlib as _il
+
+        _name = path[:-3].replace("/", ".")
+        if _name.endswith(".__init__"):
+            _name = _name[: -len(".__init__")]
+        _real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            _il.import_module(_name)
+        finally:
+            sys.stdout = _real_stdout
+    except Exception:
+        pass
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        ok = b"0"
+        try:
+            sys.stdout = open(os.devnull, "w")
+            if str(SRC) not in sys.path:
+                sys.path.insert(0, str(SRC))
+            import importlib
+
+            name = path[:-3].replace("/", ".")
+            if name.endswith(".__init__"):
+                name = name[: -len(".__init__")]
+            try:
+                mod = importlib.import_module(name)
+                ns = dict(mod.__dict__)
+            except Exception:
+                ns = {"__name__": name, "__file__": str(SRC / path)}
+            exec(code, ns)
+            ok = b"1"
+        except BaseException:
+            ok = b"0"
+        finally:
+            try:
+                os.write(w, ok)
+            except Exception:
+                pass
+            os._exit(0)
+    os.close(w)
+    try:
+        import select as _sel
+
+        ready, _, _ = _sel.select([r], [], [], 20)
+        data = os.read(r, 1) if ready else b""
+    finally:
+        os.close(r)
+        try:
+            os.kill(pid, 9) if not data else None
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    return data != b"1"
 
 
 def heavy_drop_safe(text):
