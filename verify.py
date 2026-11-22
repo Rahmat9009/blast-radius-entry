@@ -237,6 +237,73 @@ class Runner:
         os.close(w)
         return pid, r
 
+    def start_tpc(self, changes, kind, idx):
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            code = 1
+            try:
+                out = self._child_tpc(changes, kind, idx)
+                os.write(w, json.dumps(out).encode())
+                code = 0
+            except BaseException as e:  # noqa
+                try:
+                    os.write(w, json.dumps({"passed": False, "error": repr(e)[:200]}).encode())
+                except Exception:
+                    pass
+            finally:
+                os._exit(code)
+        os.close(w)
+        return pid, r
+
+    def _swap(self, changes):
+        import importlib
+
+        for path in changes:
+            mod = path[:-3].replace("/", ".")
+            if mod.endswith(".__init__"):
+                mod = mod[: -len(".__init__")]
+            importlib.import_module(mod)
+        wanted = {}
+        for path, ch in changes.items():
+            full = os.path.join(self.src, path)
+            for (qn, fl), co in ch.items():
+                wanted[(full, qn, fl)] = co
+        found = set()
+        for obj in gc.get_objects():
+            if type(obj) is types.FunctionType:
+                c = obj.__code__
+                key = (c.co_filename, c.co_qualname, c.co_firstlineno)
+                co = wanted.get(key)
+                if co is not None:
+                    obj.__code__ = co.replace(co_filename=c.co_filename)
+                    found.add(key)
+        return [list(k[1:]) for k in wanted if k not in found and not _nested_ok(k, wanted)]
+
+    def _child_tpc(self, changes, kind, idx):
+        """Run the TPC executor test's own steps for only the queries that reach the change."""
+        sys.stdout = io.StringIO()
+        missing = self._swap(changes)
+        if missing:
+            return {"passed": False, "missing": missing}
+        te = self.mods["tests/test_executor.py"]
+        cls = te.TestExecutor
+        cls.setUpClass()
+        schema = te.TPCH_SCHEMA if kind == "tpch" else te.TPCDS_SCHEMA
+        tables = cls.tpch_tables if kind == "tpch" else cls.tpcds_tables
+        sqls = cls.tpch_sqls if kind == "tpch" else cls.tpcds_sqls
+        te.initializer(*pickle.loads(pickle.dumps((schema, tables))))
+        inst = cls("test_execute_" + kind)
+        for i in idx:
+            args, sql, _ = sqls[i]
+            e = pickle.loads(pickle.dumps(te.parse_one(sql)))
+            table = te.mp_execute(e, args)
+            table = pickle.loads(pickle.dumps(table))
+            if table is not None:
+                inst.subtestHelper(i, table, tpch=(kind == "tpch"))
+        return {"passed": True}
+
     def _child(self, changes, nums, fail_fast=False):
         sys.stdout = io.StringIO()  # never let a test print to our stdout
         import importlib

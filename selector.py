@@ -186,6 +186,8 @@ class Selector:
         return res
 
     def select(self, patch_text):
+        self.ranges = []
+        self.partial_ok = True
         sel = set()
         for f in parse_patch(patch_text):
             sel |= self.select_file(f)
@@ -196,7 +198,10 @@ class Selector:
         if path is None:
             return set()
         if not path.endswith(".py"):
+            self.partial_ok = False
             return set(self.file_tests.get(path, ())) | self.dir_readers(path)
+        if not path.startswith("sqlglot/"):
+            self.partial_ok = False
         readers = set(self.file_tests.get(path, ())) | set(self.file_tests.get(f["new"] or "", ()))
         r = self._select_py(f, path)
         return r | readers
@@ -269,8 +274,10 @@ class Selector:
         if func is not None:
             # runtime code inside a function body
             r = self.lines_tests(path, lo, hi)
+            self.ranges.append((path, lo, hi))
             il = self.import_lines.get(path)
             if il and any(l in il for l in range(lo, hi + 1)):
+                self.partial_ok = False
                 # this code also runs at import time (factories, metaclasses): anything built
                 # from it then is used by tests that never run this line themselves
                 outer_i = next(
@@ -286,6 +293,7 @@ class Selector:
                 self.notes.append(("importfunc", path, line))
             return r
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.partial_ok = False
             # signature (defaults, annotations): only callers see it, and they run the body
             fb = node.body[0].lineno
             r = self.lines_tests(path, fb, node.end_lineno)
@@ -301,7 +309,9 @@ class Selector:
         # import-time statement at module or class level
         lam = self.lambda_span(path, line)
         if lam is not None:
+            self.ranges.append((path, lam[0], lam[1]))
             return self.lines_tests(path, lam[0], lam[1])
+        self.partial_ok = False
         classes = [p for p in parents if isinstance(p, ast.ClassDef)]
         if isinstance(node, ast.ClassDef):
             return self.class_users(path, classes + [node])
@@ -586,6 +596,12 @@ NEVER_DROP = {
 PARALLEL = 2
 IMPORT_LINES = {}
 SELECTOR = None
+TPC = {}
+TPC_TESTS = {}
+TPC_PROXY = {}
+PROXY_CPU_FACTOR = float(os.environ.get("BR_PROXY_CPU_FACTOR", "1.0"))
+TPC_MAP = Path(os.environ.get("BR_TPC_MAP", str(MAP.parent / "tpcmap.pkl")))
+TPC_QLIMIT = int(os.environ.get("BR_TPC_QLIMIT", "40"))
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "2.0"))
 SETUP_COST_MS = {"tests/test_executor.py": 1400, "tests/test_optimizer.py": 150}
 
@@ -597,11 +613,27 @@ def main():
     with open(MAP, "rb") as fh:
         data = pickle.load(fh)
     s = Selector(data, tests)
+    num = {t["id"]: t["number"] for t in tests}
+    try:
+        with open(TPC_MAP, "rb") as fh:
+            TPC.update(pickle.load(fh))
+        TPC_TESTS.update({
+            "tpcds": num["tests/test_executor.py::TestExecutor::test_execute_tpcds"],
+            "tpch": num["tests/test_executor.py::TestExecutor::test_execute_tpch"],
+        })
+        TPC_PROXY.update({
+            "tpcds": num["tests/test_optimizer.py::TestOptimizer::test_tpcds"],
+            "tpch": num["tests/test_optimizer.py::TestOptimizer::test_tpch"],
+        })
+    except Exception as e:
+        log("no tpc map", repr(e))
+        TPC.clear()
     global SELECTOR
     SELECTOR = s
     IMPORT_LINES.update(s.import_lines)
     results = {}
     plans = []
+    tplans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         cid = patch.stem
         try:
@@ -615,8 +647,60 @@ def main():
         results[cid] = sel
         if not sel:
             continue
+        tpc_jobs = []
+        if TPC and s.partial_ok and s.ranges:
+            for kind, tnum in TPC_TESTS.items():
+                if tnum not in sel:
+                    continue
+                info = TPC[kind]
+                if any(l in info["setup"].get(p, ()) for p, lo, hi in s.ranges for l in range(lo, hi + 1)):
+                    continue
+                mask = 0
+                for p, lo, hi in s.ranges:
+                    fl = info["lines"].get(p)
+                    if fl:
+                        for l in range(lo, hi + 1):
+                            mask |= fl.get(l, 0)
+                idx = [i for i in range(info["n"]) if mask >> i & 1]
+                if not idx:
+                    sel = sel - {tnum}
+                    log(cid, kind, "no query reaches the change: dropped")
+                else:
+                    per_q = dur[tnum] / info["n"]
+                    est = 1400 + per_q * len(idx) + 300
+                    if CPU_FACTOR * est < 0.7 * (dur[tnum] + WORKER_COST) and len(idx) <= TPC_QLIMIT:
+                        tpc_jobs.append((kind, tnum, idx))
+            # optimizer-only change: the optimizer's own TPC test (same queries, compares the
+            # optimized SQL) stands in for the executor's slow TPC test
+            if all(p.startswith("sqlglot/optimizer/") for p, _, _ in s.ranges):
+                for kind, tnum in TPC_TESTS.items():
+                    proxy = TPC_PROXY.get(kind)
+                    if tnum in sel and proxy in sel and not any(t == tnum for _, t, _ in tpc_jobs):
+                        gain = pack_cost(sel, dur) - pack_cost(sel - {tnum, proxy}, dur)
+                        # the proxy runs in-process without the pool: about 2.6x its recorded time
+                        est = 2.6 * dur[proxy] + 300
+                        if 0.6 * gain > PROXY_CPU_FACTOR * est:
+                            tpc_jobs.append(("proxy:" + kind, tnum, proxy))
+                        else:
+                            log(cid, kind, f"proxy not worth it (gain {gain / 1000:.1f}s)")
+            results[cid] = sel
         light = {n for n in sel if dur[n] <= HEAVY_MS}
-        heavy = sel - light
+        decided = set()
+        for kind, t, extra in tpc_jobs:
+            decided.add(t)
+            if kind.startswith("proxy:"):
+                decided.add(extra)
+        light -= decided
+        heavy = sel - light - decided
+        if tpc_jobs:
+            try:
+                tch = verifiable_changes(text)
+            except Exception:
+                tch = None
+            if tch:
+                for kind, tnum, idx in tpc_jobs:
+                    tplans.append((cid, tch, kind, tnum, idx))
+            tpc_jobs = []
         if not light or sum(dur[n] for n in light) > LIGHT_LIMIT_MS:
             continue
         if heavy and not DROP_HEAVY:
@@ -634,9 +718,11 @@ def main():
             changes = None
         if changes:
             plans.append((cid, changes, light, heavy))
-    if plans and os.environ.get("BR_VERIFY", "1") == "1":
+            for kind, tnum, idx in tpc_jobs:
+                tplans.append((cid, changes, kind, tnum, idx))
+    if (plans or tplans) and os.environ.get("BR_VERIFY", "1") == "1":
         try:
-            run_plans(plans, tests, dur, results)
+            run_plans(plans, tests, dur, results, tplans)
         except Exception as e:
             log("verify error", repr(e))
     out = []
@@ -675,13 +761,16 @@ def verifiable_changes(text):
     return changes or None
 
 
-def run_plans(plans, tests, dur, results):
+def run_plans(plans, tests, dur, results, tplans=()):
     import select
     import signal
 
     from verify import Runner
 
     files = {tests[n]["file"] for _, _, sel, _ in plans for n in sel}
+    if tplans:
+        files.add("tests/test_executor.py")
+        files.add("tests/test_optimizer.py")
     r = Runner(str(SRC), tests)
     t1 = time.time()
     r.prepare(files)
@@ -691,10 +780,29 @@ def run_plans(plans, tests, dur, results):
     log(f"prepared {len(r.mods)} test modules in {time.time() - t1:.2f}s")
     queue = [p for p in plans if r.can_run(p[2])]
     queue.sort(key=lambda p: -sum(dur[n] for n in p[3]))
+    tq = []
+    for t in tplans:
+        need = "tests/test_optimizer.py" if t[2].startswith("proxy:") else "tests/test_executor.py"
+        if need in r.mods:
+            tq.append(("tpc",) + tuple(t))
+    queue = tq + queue
     running = {}
     while queue or running:
         while queue and len(running) < PARALLEL:
-            cid, changes, sel, heavy = queue.pop(0)
+            job = queue.pop(0)
+            if job[0] == "tpc":
+                _, cid, changes, kind, tnum, idx = job
+                if kind.startswith("proxy:"):
+                    proxy = idx
+                    pid, fd = r.start(changes, {proxy})
+                    limit = 15 + 8 * dur[proxy] / 1000
+                    running[fd] = (pid, cid, {proxy}, time.time() + limit, [], ("proxy", kind, tnum, proxy))
+                    continue
+                pid, fd = r.start_tpc(changes, kind, idx)
+                limit = 20 + 1.0 * len(idx)
+                running[fd] = (pid, cid, {tnum}, time.time() + limit, [], ("tpc", kind, tnum))
+                continue
+            cid, changes, sel, heavy = job
             pid, fd = r.start(changes, sel, fail_fast=bool(heavy))
             limit = 8 + 8 * sum(dur[n] for n in sel) / 1000
             running[fd] = (pid, cid, sel, time.time() + limit, [], heavy)
@@ -715,6 +823,24 @@ def run_plans(plans, tests, dur, results):
                 res = json.loads(b"".join(buf) or b"{}")
             except ValueError:
                 res = {}
+            if isinstance(heavy, tuple) and heavy and heavy[0] == "proxy":
+                _, kind, tnum, proxy = heavy
+                if "bad" in res and not res.get("missing") and not res["bad"]:
+                    results[cid] = results[cid] - {tnum, proxy}
+                    log(cid, kind, "proxy passed: dropped both")
+                else:
+                    results[cid] = results[cid] | {tnum, proxy}
+                    log(cid, kind, "proxy failed or unclear: kept", res.get("error"))
+                continue
+            if isinstance(heavy, tuple) and heavy and heavy[0] == "tpc":
+                tnum = heavy[2]
+                if res.get("passed") is True and not res.get("missing"):
+                    results[cid] = results[cid] - {tnum}
+                    log(cid, heavy[1], "partial run passed: dropped")
+                else:
+                    results[cid] = results[cid] | {tnum}
+                    log(cid, heavy[1], "partial run kept", res.get("error"))
+                continue
             if "bad" in res and not res.get("missing"):
                 bad = set(res["bad"]) & sel
                 if heavy and (bad or len(sel) < MIN_LIGHT_FOR_DROP):
@@ -725,7 +851,8 @@ def run_plans(plans, tests, dur, results):
                     # fast tests on the same code all pass: drop slow behaviour tests, but keep
                     # the resource-limit tests (memory, node limits) that fast tests cannot stand in for
                     bad = {h for h in heavy if tests[h]["id"] in NEVER_DROP}
-                results[cid] = bad
+                keep_tpc = {t for t in list(TPC_TESTS.values()) + list(TPC_PROXY.values()) if t in results[cid] and t not in sel}
+                results[cid] = bad | keep_tpc
                 log(cid, "verified", len(sel), "+", len(heavy), "->", len(results[cid]))
             else:
                 log(cid, "unverified", res.get("error"), res.get("missing"))
@@ -740,6 +867,10 @@ def run_plans(plans, tests, dur, results):
                 os.close(fd)
                 os.waitpid(pid, 0)
                 del running[fd]
+                if isinstance(heavy, tuple) and heavy and heavy[0] == "tpc":
+                    results[cid] = results[cid] | {heavy[2]}
+                if isinstance(heavy, tuple) and heavy and heavy[0] == "proxy":
+                    results[cid] = results[cid] | {heavy[2], heavy[3]}
                 log(cid, "timeout: keeping all", len(sel))
 
 
