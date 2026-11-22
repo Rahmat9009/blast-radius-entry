@@ -481,12 +481,9 @@ _SWAP = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq,
 
 
 def _singleton(n):
-    """None/True/False, or an enum-like member such as TokenType.L_PAREN."""
-    if isinstance(n, ast.Constant) and n.value in (None, True, False) and type(n.value) is not int:
-        return True
-    if isinstance(n, ast.Attribute) and n.attr.isupper() and isinstance(n.value, ast.Name):
-        return n.value.id[:1].isupper() and not n.value.id.isupper()
-    return False
+    """Only None: `0 == False` and str/int enums compare equal to plain values, so
+    `is` and `==` differ there (found by ChatGPT's mutation run)."""
+    return isinstance(n, ast.Constant) and n.value is None
 
 
 def is_eq_swap(old_text, new_text, changed):
@@ -599,6 +596,7 @@ SELECTOR = None
 TPC = {}
 TPC_TESTS = {}
 TPC_PROXY = {}
+DECIDED = {}
 PROXY_CPU_FACTOR = float(os.environ.get("BR_PROXY_CPU_FACTOR", "1.0"))
 TPC_MAP = Path(os.environ.get("BR_TPC_MAP", str(MAP.parent / "tpcmap.pkl")))
 TPC_QLIMIT = int(os.environ.get("BR_TPC_QLIMIT", "40"))
@@ -692,6 +690,8 @@ def main():
                 decided.add(extra)
         light -= decided
         heavy = sel - light - decided
+        if decided:
+            DECIDED[cid] = set(decided)
         if tpc_jobs:
             try:
                 tch = verifiable_changes(text)
@@ -704,6 +704,8 @@ def main():
         if not light or sum(dur[n] for n in light) > LIGHT_LIMIT_MS:
             continue
         if heavy and not DROP_HEAVY:
+            continue
+        if heavy and not heavy_drop_safe(text):
             continue
         est_cpu = sum(dur[n] for n in light) + sum(
             SETUP_COST_MS.get(f, 0) for f in {tests[n]["file"] for n in light}
@@ -731,6 +733,22 @@ def main():
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     log(f"done in {time.time() - t0:.2f}s, verified {len(plans)}")
+
+
+_BIGNUM = re.compile(r"(?<![\w.])\d{3,}")
+
+
+def heavy_drop_safe(text):
+    """Fast tests stand in for slow ones only when the change cannot depend on data size:
+    not in the executor or planner, and no large numbers in the changed lines."""
+    for f in parse_patch(text):
+        p = f["old"] or f["new"] or ""
+        if p.startswith(("sqlglot/executor/", "sqlglot/planner")):
+            return False
+    for ln in text.split("\n"):
+        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---")) and _BIGNUM.search(ln):
+            return False
+    return True
 
 
 def verifiable_changes(text):
@@ -851,7 +869,7 @@ def run_plans(plans, tests, dur, results, tplans=()):
                     # fast tests on the same code all pass: drop slow behaviour tests, but keep
                     # the resource-limit tests (memory, node limits) that fast tests cannot stand in for
                     bad = {h for h in heavy if tests[h]["id"] in NEVER_DROP}
-                keep_tpc = {t for t in list(TPC_TESTS.values()) + list(TPC_PROXY.values()) if t in results[cid] and t not in sel}
+                keep_tpc = results[cid] & DECIDED.get(cid, set())
                 results[cid] = bad | keep_tpc
                 log(cid, "verified", len(sel), "+", len(heavy), "->", len(results[cid]))
             else:
