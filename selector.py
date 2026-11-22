@@ -398,19 +398,24 @@ class Selector:
             return r
         # import-time statement at module or class level
         lam = self.lambda_span(path, line)
+        lam_r = set()
         if lam is not None:
             self.ranges.append((path, lam[0], lam[1]))
-            return self.lines_tests(path, lam[0], lam[1])
+            lam_r = self.lines_tests(path, lam[0], lam[1])
+            if lam[1] > lam[0] and lam_r:
+                return lam_r
+            # a one-line lambda produces no line events when it runs, so its coverage is
+            # missing: also take the users of the dict/attribute that holds it
         self.partial_ok = False
         classes = [p for p in parents if isinstance(p, ast.ClassDef)]
         if isinstance(node, ast.ClassDef):
             return self.class_users(path, classes + [node])
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            return self.attr_users(path, classes, node)
+            return lam_r | self.attr_users(path, classes, node)
         if classes:
-            return self.class_users(path, classes)
+            return lam_r | self.class_users(path, classes)
         # module level import or other statement
-        r = set(self.mod_tests.get(path, ()))
+        r = set(self.mod_tests.get(path, ())) | lam_r
         for name in assigned_names(node):
             r |= self.name_users(path, name)
         return r
