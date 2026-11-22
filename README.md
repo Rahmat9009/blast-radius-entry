@@ -34,3 +34,9 @@ dialects and expression classes used. `tools/buildmap.py` merges those traces in
 ## License
 
 MIT
+
+## Coverage guard revision
+
+The guard combines the original selector with a separately collected baseline line and fixture index. The second index traces tests in actual worker processes and gives the selector another source of evidence for short-circuit expressions and class settings. The runtime emits the union of both candidate sets and schedules it using integer-millisecond test durations. It uses the Python standard library.
+
+The source archive and test coverage both come from the pinned, unmodified SQLGlot checkout. Published sample answers are used for local evaluation.
