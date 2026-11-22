@@ -39,12 +39,25 @@ def parse_patch(text):
     while i < len(lines):
         ln = lines[i]
         if ln.startswith("diff --git "):
-            cur = {"old": None, "new": None, "hunks": []}
+            cur = {"old": None, "new": None, "hunks": [], "binary": False, "raw": []}
             files.append(cur)
             hunk = None
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", ln)
+            if m:
+                cur["old"], cur["new"] = m.group(1), m.group(2)
+        elif cur is not None and hunk is None and ln.startswith("new file mode"):
+            cur["old"] = None
+        elif cur is not None and hunk is None and ln.startswith("deleted file mode"):
+            cur["new"] = None
+        elif cur is not None and hunk is None and ln.startswith("rename from "):
+            cur["old"] = ln[len("rename from "):]
+        elif cur is not None and hunk is None and ln.startswith("rename to "):
+            cur["new"] = ln[len("rename to "):]
+        elif cur is not None and hunk is None and (ln.startswith("GIT binary patch") or ln.startswith("Binary files ")):
+            cur["binary"] = True
         elif ln.startswith("--- ") and (hunk is None or hunk_done(hunk)):
             if cur is None:
-                cur = {"old": None, "new": None, "hunks": []}
+                cur = {"old": None, "new": None, "hunks": [], "binary": False, "raw": []}
                 files.append(cur)
             p = ln[4:].split("\t")[0]
             cur["old"] = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
@@ -68,9 +81,11 @@ def parse_patch(text):
             if ln.startswith("\\"):
                 pass
             elif ln.startswith("+"):
+                cur["raw"].append(ln[1:])
                 hunk["lines"].append(("+", ln[1:]))
                 hunk["n"] += 1
             elif ln.startswith("-"):
+                cur["raw"].append(ln[1:])
                 hunk["lines"].append(("-", ln[1:]))
                 hunk["o"] += 1
             else:
@@ -197,6 +212,23 @@ class Selector:
         path = f["old"] or f["new"]
         if path is None:
             return set()
+        everything = {t["number"] for t in self.tests}
+        base = os.path.basename(f["new"] or path)
+        # test-runner configuration can change how every test runs
+        if base in ("conftest.py", "pytest.ini", "tox.ini") or (
+            base in ("pyproject.toml", "setup.cfg") and any("pytest" in x for x in f.get("raw", ()))
+        ):
+            self.partial_ok = False
+            return everything
+        if f.get("binary"):
+            self.partial_ok = False
+            r = set(self.file_tests.get(path, ())) | set(self.file_tests.get(f["new"] or "", ()))
+            if path.endswith(".py") or (f["new"] or "").endswith(".py"):
+                return everything
+            return r
+        if f["old"] is None or f["new"] is None or f["old"] != f["new"]:
+            self.partial_ok = False
+            return self.structural(f)
         if not path.endswith(".py"):
             self.partial_ok = False
             return set(self.file_tests.get(path, ())) | self.dir_readers(path)
@@ -247,6 +279,56 @@ class Selector:
 
     def dir_readers(self, path):
         return set()
+
+    def structural(self, f):
+        """A file is added, deleted or renamed: no coverage exists for it."""
+        old, new = f["old"], f["new"]
+        res = set()
+        everything = {t["number"] for t in self.tests}
+        for p, gone in ((old, True), (new, False)):
+            if p is None:
+                continue
+            res |= set(self.file_tests.get(p, ()))
+            if p == old and new == old:
+                continue
+            if p.endswith(".py") and p.startswith("sqlglot/"):
+                if gone:
+                    return everything  # importers of a vanished module all break
+                pkg = os.path.dirname(p)
+                stem = os.path.basename(p)[:-3]
+                # tests that discover modules by scanning the package
+                if pkg.startswith("sqlglot/typing"):
+                    res |= set(self.by_file.get("tests/test_typing.py", ()))
+                if pkg.startswith("sqlglot/dialects"):
+                    for tf in ("tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py"):
+                        res |= set(self.by_file.get(tf, ()))
+                # test files that import the new module by name (other files in the same patch
+                # that import it are analysed as their own changes)
+                dotted = p[:-3].replace("/", ".")
+                pkg_dotted = pkg.replace("/", ".")
+                pat = re.compile(
+                    r"\b" + re.escape(dotted) + r"\b|from\s+" + re.escape(pkg_dotted)
+                    + r"\s+import\s+[^\n]*\b" + re.escape(stem) + r"\b"
+                )
+                for tf, nums in self.by_file.items():
+                    try:
+                        if pat.search(self.read_src(tf)):
+                            res |= set(nums)
+                    except OSError:
+                        pass
+            elif p.endswith(".py") and p.startswith("tests/"):
+                stem = os.path.basename(p)[:-3]
+                if gone:
+                    pat = re.compile(r"\b" + re.escape(stem) + r"\b")
+                    for tf, nums in self.by_file.items():
+                        try:
+                            if tf == p or pat.search(self.read_src(tf)):
+                                res |= set(nums)
+                        except OSError:
+                            pass
+            elif gone:
+                res |= set(self.file_tests.get(p, ()))
+        return res
 
     def importers(self, path):
         return set(self.mod_tests.get(path, ())) | set(self.by_file.get(path, ()))
