@@ -213,6 +213,9 @@ class Selector:
 
         if same_code(path, old_text, new_text):
             return set()
+        if is_eq_swap(old_text, new_text, changed):
+            self.notes.append(("eqswap", path))
+            return set()
         from verify import ccompile
 
         try:
@@ -283,13 +286,17 @@ class Selector:
                 self.notes.append(("importfunc", path, line))
             return r
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # signature / decorator: tests that call the function
+            # signature (defaults, annotations): only callers see it, and they run the body
             fb = node.body[0].lineno
             r = self.lines_tests(path, fb, node.end_lineno)
-            if any(isinstance(p, ast.ClassDef) for p in parents) or node.decorator_list:
-                r |= self.class_users(path, parents) if parents else set()
-            if not parents:
-                r |= self.name_users(path, node.name)
+            if node.decorator_list and line < node.lineno:
+                # a decorator changed: it runs at import and can change how the class or
+                # module uses this function
+                classes = [p for p in parents if isinstance(p, ast.ClassDef)]
+                if classes:
+                    r |= self.class_users(path, classes)
+                else:
+                    r |= self.name_users(path, node.name) | set(self.mod_tests.get(path, ()))
             return r
         # import-time statement at module or class level
         lam = self.lambda_span(path, line)
@@ -458,6 +465,60 @@ class Selector:
         if t is None:
             t = self._src_cache[f] = (SRC / f).read_text()
         return t
+
+
+_SWAP = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
+
+
+def _singleton(n):
+    """None/True/False, or an enum-like member such as TokenType.L_PAREN."""
+    if isinstance(n, ast.Constant) and n.value in (None, True, False) and type(n.value) is not int:
+        return True
+    if isinstance(n, ast.Attribute) and n.attr.isupper() and isinstance(n.value, ast.Name):
+        return n.value.id[:1].isupper() and not n.value.id.isupper()
+    return False
+
+
+def is_eq_swap(old_text, new_text, changed):
+    """True if the only change is `is` <-> `==` (or `is not` <-> `!=`) against None, True,
+    False or an enum member, which behaves the same for every object sqlglot compares."""
+    lines = [c for c in changed if c > 0]
+    if len(lines) != 1 or len(changed) != 1:
+        return False
+    ln = lines[0]
+    try:
+        old_tree = ast.parse(old_text)
+        new_tree = ast.parse(new_text)
+    except SyntaxError:
+        return False
+    old_nodes = [n for n in ast.walk(old_tree) if isinstance(n, ast.Compare) and n.lineno <= ln <= n.end_lineno]
+    new_nodes = [n for n in ast.walk(new_tree) if isinstance(n, ast.Compare) and n.lineno <= ln <= n.end_lineno]
+    diffs = []
+    for a, b in zip(old_nodes, new_nodes):
+        if ast.dump(a) == ast.dump(b):
+            continue
+        if len(a.ops) != len(b.ops) or ast.dump(a.left) != ast.dump(b.left):
+            return False
+        if [ast.dump(c) for c in a.comparators] != [ast.dump(c) for c in b.comparators]:
+            return False
+        for i, (x, y) in enumerate(zip(a.ops, b.ops)):
+            if type(x) is type(y):
+                continue
+            if (type(x), type(y)) not in _SWAP:
+                return False
+            lhs = a.left if i == 0 else a.comparators[i - 1]
+            rhs = a.comparators[i]
+            if not (_singleton(lhs) or _singleton(rhs)):
+                return False
+            diffs.append(i)
+    if len(old_nodes) != len(new_nodes) or len(diffs) != 1:
+        return False
+    # everything else in the file must be identical
+    old_lines = old_text.split("\n")
+    new_lines = new_text.split("\n")
+    if len(old_lines) != len(new_lines):
+        return False
+    return all(o == n for i, (o, n) in enumerate(zip(old_lines, new_lines)) if i != ln - 1)
 
 
 def _qual_ok(q, mine):
