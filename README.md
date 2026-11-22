@@ -24,6 +24,14 @@ How it decides:
 runs process-pool work in-process (with pickling) so it is traced too, and records files opened,
 dialects and expression classes used. `tools/buildmap.py` merges those traces into `map.pkl`.
 
+`tools/mergeidx.py` also merges in `coverage.json.gz` (an independent coverage index traced
+in real pool worker processes, built by `build_index.py`) so the map is the union of both.
+
+At run time, when a commit's candidate tests are fast, they are run against the patched code
+(changed function bodies swapped in, in a forked child) and only the tests that really fail are
+listed. Slow behaviour tests are dropped only when every fast test covering the same code passes;
+memory and node-limit tests are never dropped.
+
 ## Open-source code used
 
 - `src/` is an unmodified copy of the `.py` files of [sqlglot](https://github.com/tobymao/sqlglot)
